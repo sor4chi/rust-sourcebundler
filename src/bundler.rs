@@ -17,9 +17,11 @@ use regex::Regex;
 
 const LIBRS_FILENAME: &str = "src/lib.rs";
 lazy_static! {
-    static ref COMMENT_RE: Regex = source_line_regex(r" ").unwrap();
     static ref WARN_RE: Regex = source_line_regex(r" #!\[warn\(.*").unwrap();
-    static ref USECRATE_RE: Regex = source_line_regex(r" use  crate::(?P<submod>.*)$").unwrap();
+    // The lib is wrapped in `pub mod <crate_name>`, so absolute `crate::` paths inside
+    // the lib are rewritten to `crate::<crate_name>::`. This is correct for both `use`
+    // statements and inline expression paths, regardless of module nesting depth.
+    static ref CRATE_PATH_RE: Regex = Regex::new(r"\bcrate::").unwrap();
     static ref MINIFY_RE: Regex = Regex::new(r"^\s*(?P<contents>.*)\s*$").unwrap();
 }
 
@@ -31,6 +33,8 @@ pub struct Bundler<'a> {
     _crate_name: String,
     skip_use: HashSet<String>,
     minify: bool,
+    /// Whether the line currently being processed comes from the lib (rewrites crate:: when true).
+    in_lib: bool,
 }
 
 /// Defines a regex to match a line of rust source.
@@ -68,6 +72,7 @@ impl<'a> Bundler<'a> {
             _crate_name: String::from(""),
             skip_use: HashSet::new(),
             minify: false,
+            in_lib: false,
         }
     }
 
@@ -142,7 +147,7 @@ impl<'a> Bundler<'a> {
         let mut line = String::new();
         while bin_reader.read_line(&mut line)? > 0 {
             line.truncate(line.trim_end().len());
-            if COMMENT_RE.is_match(&line) || WARN_RE.is_match(&line) {
+            if WARN_RE.is_match(&line) {
             } else if extcrate_re.is_match(&line) {
                 writeln!(self.bundle_file, "pub mod {} {{", self._crate_name)?;
                 self.librs()?;
@@ -168,36 +173,32 @@ impl<'a> Bundler<'a> {
 
         let mod_re = source_line_regex(r" (pub  )?mod  (?P<m>.+) ; ")?;
 
+        self.in_lib = true;
         let mut line = String::new();
         while lib_reader.read_line(&mut line)? > 0 {
             line.pop();
-            if COMMENT_RE.is_match(&line) || WARN_RE.is_match(&line) {
+            if WARN_RE.is_match(&line) {
             } else if let Some(cap) = mod_re.captures(&line) {
                 let modname = cap
                     .name("m")
                     .ok_or_else(|| anyhow!("capture not found"))?
                     .as_str();
                 if modname != "tests" {
-                    self.usemod(modname, modname, modname, 1)?;
+                    self.usemod(modname, modname, modname)?;
                 }
             } else {
                 self.write_line(&line)?;
             }
             line.clear(); // clear to reuse the buffer
         }
+        self.in_lib = false;
         Ok(())
     }
 
     /// Called to expand random .rs files from lib.rs. It recursivelly
     /// expands further "pub mod <>;" lines and updates the list of
     /// "use <>;" lines that have to be skipped.
-    fn usemod(
-        &mut self,
-        mod_name: &str,
-        mod_path: &str,
-        mod_import: &str,
-        lvl: usize,
-    ) -> Result<()> {
+    fn usemod(&mut self, mod_name: &str, mod_path: &str, mod_import: &str) -> Result<()> {
         let mod_filenames0 = [
             format!("src/{}.rs", mod_path),
             format!("src/{}/mod.rs", mod_path),
@@ -219,32 +220,9 @@ impl<'a> Bundler<'a> {
         writeln!(self.bundle_file, "pub mod {} {{", mod_name)?;
         self.skip_use.insert(String::from(mod_import));
 
-        let mut inner_submod = String::new();
         while mod_reader.read_line(&mut line)? > 0 {
             line.truncate(line.trim_end().len());
-            if COMMENT_RE.is_match(&line) || WARN_RE.is_match(&line) {
-            } else if USECRATE_RE.is_match(&line) || !inner_submod.is_empty() {
-                if let Some(cap) = USECRATE_RE.captures(&line) {
-                    write!(self.bundle_file, "use ")?;
-                    for _ in 0..lvl {
-                        write!(self.bundle_file, "super::")?;
-                    }
-                    let submodname = cap
-                        .name("submod")
-                        .ok_or_else(|| anyhow!("capture not found"))?
-                        .as_str();
-                    if submodname.ends_with(';') {
-                        writeln!(self.bundle_file, "{}", submodname)?;
-                    } else {
-                        inner_submod = submodname.to_string();
-                    }
-                } else {
-                    inner_submod.push_str(&line);
-                    if inner_submod.ends_with(';') {
-                        writeln!(self.bundle_file, "{}", inner_submod)?;
-                        inner_submod.clear();
-                    }
-                }
+            if WARN_RE.is_match(&line) {
             } else if let Some(cap) = mod_re.captures(&line) {
                 let submodname = cap
                     .name("m")
@@ -253,12 +231,7 @@ impl<'a> Bundler<'a> {
                 if submodname != "tests" {
                     let submodfile = format!("{}/{}", mod_path, submodname);
                     let submodimport = format!("{}::{}", mod_import, submodname);
-                    self.usemod(
-                        submodname,
-                        submodfile.as_str(),
-                        submodimport.as_str(),
-                        lvl + 1,
-                    )?;
+                    self.usemod(submodname, submodfile.as_str(), submodimport.as_str())?;
                 }
             } else {
                 self.write_line(&line)?;
@@ -272,6 +245,14 @@ impl<'a> Bundler<'a> {
     }
 
     fn write_line(&mut self, line: &str) -> Result<()> {
+        // Rewrite absolute crate:: paths inside the lib to crate::<crate_name>::.
+        let cow = if self.in_lib {
+            let repl = format!("crate::{}::", self._crate_name);
+            CRATE_PATH_RE.replace_all(line, repl.as_str())
+        } else {
+            std::borrow::Cow::Borrowed(line)
+        };
+        let line: &str = &cow;
         if self.minify {
             writeln!(
                 self.bundle_file,

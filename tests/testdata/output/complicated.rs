@@ -5,7 +5,8 @@ pub fn a() {
 }
 }
 pub mod b {
-use super::a;
+use crate::complicated::a;
+
 pub fn b() {
     a::a();
 }
@@ -18,7 +19,9 @@ pub fn d() {
 }
 }
 }
+
 use self::complicated::{a, b, c};
+
 fn main() {
     a::a();
     self::b::b();

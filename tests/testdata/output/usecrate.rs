@@ -5,9 +5,11 @@ pub fn hello_world1() {
 }
 }
 pub mod submod2 {
-use super::submod1;
+use crate::usecrate::submod1;
+// full-line comment: should be preserved in the bundle
 pub fn hello_world2() {
-    submod1::hello_world1();
+    submod1::hello_world1(); // via `use crate::usecrate::submod1`
+    crate::usecrate::submod1::hello_world1(); // inline crate::usecrate:: path
     println!("Hello, world 2!");
 }
 }
@@ -17,7 +19,11 @@ pub fn hello_world3__long_identifier_name_for_multiline() {
 }
 }
 pub mod submod4 {
-use super::{    submod1,    submod3::hello_world3__long_identifier_name_for_multiline,};
+use crate::usecrate::{
+    submod1,
+    submod3::hello_world3__long_identifier_name_for_multiline,
+};
+
 pub fn hello_world4() {
     submod1::hello_world1();
     hello_world3__long_identifier_name_for_multiline();
@@ -27,6 +33,7 @@ pub fn hello_world4() {
 }
 use self::usecrate::submod2::hello_world2;
 use self::usecrate::submod4::hello_world4;
+
 fn main() {
     hello_world2();
     hello_world4();

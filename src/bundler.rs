@@ -35,6 +35,10 @@ pub struct Bundler<'a> {
     minify: bool,
     /// Whether the line currently being processed comes from the lib (rewrites crate:: when true).
     in_lib: bool,
+    /// Whether to strip comments from the output (useful to avoid leaking notes in submissions).
+    strip_comments: bool,
+    /// Tracks multi-line `/* */` block-comment state while stripping comments.
+    in_block: bool,
 }
 
 /// Defines a regex to match a line of rust source.
@@ -73,11 +77,19 @@ impl<'a> Bundler<'a> {
             skip_use: HashSet::new(),
             minify: false,
             in_lib: false,
+            strip_comments: false,
+            in_block: false,
         }
     }
 
     pub fn minify_set(&mut self, enable: bool) {
         self.minify = enable;
+    }
+
+    /// When enabled, `//` line comments and `/* */` block comments are removed
+    /// from the output (string, char, and raw-string literals are preserved).
+    pub fn strip_comments_set(&mut self, enable: bool) {
+        self.strip_comments = enable;
     }
 
     pub fn crate_name(&mut self, name: &'a str) {
@@ -245,6 +257,17 @@ impl<'a> Bundler<'a> {
     }
 
     fn write_line(&mut self, line: &str) -> Result<()> {
+        // Optionally strip comments. Drop lines that become empty (full-line comments).
+        let stripped;
+        let line = if self.strip_comments {
+            stripped = self.strip_comments_in_line(line);
+            if stripped.trim().is_empty() {
+                return Ok(());
+            }
+            stripped.as_str()
+        } else {
+            line
+        };
         // Rewrite absolute crate:: paths inside the lib to crate::<crate_name>::.
         let cow = if self.in_lib {
             let repl = format!("crate::{}::", self._crate_name);
@@ -263,5 +286,207 @@ impl<'a> Bundler<'a> {
             writeln!(self.bundle_file, "{}", line)
         }
         .map_err(|e| anyhow!(e))
+    }
+
+    /// Remove `//` line comments and `/* */` block comments from a single line,
+    /// while preserving string, char, byte-string and raw-string literals.
+    /// `self.in_block` carries block-comment state across lines.
+    ///
+    /// Limitation: a raw string that spans multiple lines is not tracked across
+    /// lines (single-line raw strings, the common case, are handled correctly).
+    fn strip_comments_in_line(&mut self, line: &str) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let n = chars.len();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0;
+        while i < n {
+            if self.in_block {
+                if chars[i] == '*' && i + 1 < n && chars[i + 1] == '/' {
+                    self.in_block = false;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            let c = chars[i];
+            // Line comment: the rest of the line is dropped.
+            if c == '/' && i + 1 < n && chars[i + 1] == '/' {
+                break;
+            }
+            // Block comment start.
+            if c == '/' && i + 1 < n && chars[i + 1] == '*' {
+                self.in_block = true;
+                i += 2;
+                continue;
+            }
+            // Raw string: r"...", r#"..."#, br"...", etc.
+            if (c == 'r' || c == 'b') && !is_ident_char(prev_char(&chars, i)) {
+                if let Some(next) = copy_raw_string(&chars, i, &mut out) {
+                    i = next;
+                    continue;
+                }
+            }
+            // Normal string / byte string literal.
+            if c == '"' {
+                out.push(c);
+                i += 1;
+                while i < n {
+                    let d = chars[i];
+                    out.push(d);
+                    i += 1;
+                    if d == '\\' && i < n {
+                        out.push(chars[i]);
+                        i += 1;
+                    } else if d == '"' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // Char literal vs lifetime/label.
+            if c == '\'' {
+                if i + 1 < n && chars[i + 1] == '\\' {
+                    // Escaped char literal: '\n', '\'', '\u{..}', ...
+                    out.push(c);
+                    i += 1;
+                    while i < n {
+                        let d = chars[i];
+                        out.push(d);
+                        i += 1;
+                        if d == '\\' && i < n {
+                            out.push(chars[i]);
+                            i += 1;
+                        } else if d == '\'' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if i + 2 < n && chars[i + 2] == '\'' {
+                    // Simple char literal: 'x', '"', '/' ...
+                    out.push(chars[i]);
+                    out.push(chars[i + 1]);
+                    out.push(chars[i + 2]);
+                    i += 3;
+                    continue;
+                }
+                // Otherwise a lifetime/label ('a, 'static): treat ' as ordinary.
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+}
+
+/// The char before `i`, or a space when at the start of the line.
+fn prev_char(chars: &[char], i: usize) -> char {
+    if i == 0 {
+        ' '
+    } else {
+        chars[i - 1]
+    }
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// If a raw string literal (`r"..."`, `r#"..."#`, `br"..."`, ...) starts at
+/// `start`, copy it verbatim into `out` and return the index just past it.
+/// Returns `None` when there is no raw string at `start` (e.g. a raw identifier
+/// `r#ident`, or a plain `r`/`b` in code).
+fn copy_raw_string(chars: &[char], start: usize, out: &mut String) -> Option<usize> {
+    let n = chars.len();
+    let mut i = start;
+    if chars[i] == 'b' {
+        if i + 1 >= n || chars[i + 1] != 'r' {
+            return None;
+        }
+        i += 1;
+    }
+    if chars[i] != 'r' {
+        return None;
+    }
+    let mut j = i + 1;
+    let mut hashes = 0;
+    while j < n && chars[j] == '#' {
+        hashes += 1;
+        j += 1;
+    }
+    if j >= n || chars[j] != '"' {
+        return None; // raw identifier or just a letter, not a raw string.
+    }
+    for &ch in &chars[start..=j] {
+        out.push(ch);
+    }
+    let mut k = j + 1;
+    while k < n {
+        if chars[k] == '"' {
+            let closing = (1..=hashes).all(|h| k + h < n && chars[k + h] == '#');
+            if closing {
+                out.push('"');
+                for _ in 0..hashes {
+                    out.push('#');
+                }
+                return Some(k + 1 + hashes);
+            }
+        }
+        out.push(chars[k]);
+        k += 1;
+    }
+    Some(k) // unterminated on this line (multi-line raw strings are not tracked).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn strip(line: &str) -> String {
+        let mut b = Bundler::new_fd(Path::new("x"), Box::new(Vec::new()));
+        b.strip_comments_in_line(line)
+    }
+
+    #[test]
+    fn strips_full_line_and_trailing_comments() {
+        assert_eq!(strip("    // a note").trim(), "");
+        assert_eq!(strip("let x = 1; // trailing"), "let x = 1; ");
+        assert_eq!(strip("/// doc").trim(), "");
+        assert_eq!(strip("//! inner doc").trim(), "");
+    }
+
+    #[test]
+    fn keeps_comment_markers_inside_strings() {
+        assert_eq!(strip(r#"let u = "http://x"; // c"#), r#"let u = "http://x"; "#);
+        assert_eq!(strip(r#"let s = "a // b /* c";"#), r#"let s = "a // b /* c";"#);
+    }
+
+    #[test]
+    fn keeps_char_literals_and_lifetimes() {
+        // '"' is a char literal holding a double quote; must not start a string.
+        assert_eq!(strip(r#"let c = '"'; // x"#), r#"let c = '"'; "#);
+        assert_eq!(strip("let c = '/'; // x"), "let c = '/'; ");
+        // Lifetimes must not be treated as char literals.
+        assert_eq!(strip("fn f<'a>(x: &'a str) {} // x"), "fn f<'a>(x: &'a str) {} ");
+        assert_eq!(strip("T: Fn() + 'static // x"), "T: Fn() + 'static ");
+    }
+
+    #[test]
+    fn keeps_raw_strings() {
+        assert_eq!(strip(r##"let r = r"a//b"; // c"##), r##"let r = r"a//b"; "##);
+        assert_eq!(strip(r####"let r = r#"a"//b"#; // c"####), r####"let r = r#"a"//b"#; "####);
+    }
+
+    #[test]
+    fn handles_block_comments_across_lines() {
+        let mut b = Bundler::new_fd(Path::new("x"), Box::new(Vec::new()));
+        assert_eq!(b.strip_comments_in_line("code; /* start").trim(), "code;");
+        assert_eq!(b.strip_comments_in_line("still in comment").trim(), "");
+        assert_eq!(b.strip_comments_in_line("end */ tail").trim(), "tail");
     }
 }

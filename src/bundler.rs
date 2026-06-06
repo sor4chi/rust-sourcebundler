@@ -39,6 +39,9 @@ pub struct Bundler<'a> {
     strip_comments: bool,
     /// Tracks multi-line `/* */` block-comment state while stripping comments.
     in_block: bool,
+    /// While true, subsequent `//` comment lines are preserved verbatim despite `strip_comments`
+    /// (entered by a lone `// bundle-keep` marker line; the marker itself is dropped).
+    keep_block: bool,
 }
 
 /// Defines a regex to match a line of rust source.
@@ -79,6 +82,7 @@ impl<'a> Bundler<'a> {
             in_lib: false,
             strip_comments: false,
             in_block: false,
+            keep_block: false,
         }
     }
 
@@ -257,6 +261,22 @@ impl<'a> Bundler<'a> {
     }
 
     fn write_line(&mut self, line: &str) -> Result<()> {
+        // Credit/license preservation: a lone `// bundle-keep` marker enters "keep mode" in which
+        // the following `//` comment lines are kept verbatim despite strip_comments. The marker
+        // line itself is dropped from the output. Keep mode ends at the first non-comment line.
+        if self.strip_comments {
+            let trimmed = line.trim_start();
+            if trimmed == "// bundle-keep" {
+                self.keep_block = true;
+                return Ok(());
+            }
+            if self.keep_block {
+                if trimmed.starts_with("//") {
+                    return self.emit_line(line);
+                }
+                self.keep_block = false;
+            }
+        }
         // Optionally strip comments. Drop lines that become empty (full-line comments).
         let stripped;
         let line = if self.strip_comments {
@@ -268,6 +288,11 @@ impl<'a> Bundler<'a> {
         } else {
             line
         };
+        self.emit_line(line)
+    }
+
+    /// Apply crate:: rewriting and minify, then write the line. Comment handling already done.
+    fn emit_line(&mut self, line: &str) -> Result<()> {
         // Rewrite absolute crate:: paths inside the lib to crate::<crate_name>::.
         let cow = if self.in_lib {
             let repl = format!("crate::{}::", self._crate_name);
@@ -488,5 +513,40 @@ mod tests {
         assert_eq!(b.strip_comments_in_line("code; /* start").trim(), "code;");
         assert_eq!(b.strip_comments_in_line("still in comment").trim(), "");
         assert_eq!(b.strip_comments_in_line("end */ tail").trim(), "tail");
+    }
+
+    #[test]
+    fn bundle_keep_preserves_credit_and_drops_marker() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        struct SharedBuf(Rc<RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let mut b = Bundler::new_fd(Path::new("x"), Box::new(SharedBuf(buf.clone())));
+        b.strip_comments_set(true);
+        for l in [
+            "// bundle-keep",
+            "// based on the original Foo library",
+            "// (c) 2020 Example Author",
+            "let x = 1; // strip this trailing note",
+            "// a normal note after the block",
+        ] {
+            b.write_line(l).unwrap();
+        }
+        let out = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(!out.contains("bundle-keep"), "marker line must be dropped");
+        assert!(out.contains("// based on the original Foo library"));
+        assert!(out.contains("// (c) 2020 Example Author"));
+        assert!(out.contains("let x = 1;"), "code line kept");
+        assert!(!out.contains("strip this trailing note"), "keep mode ends at code line");
+        assert!(!out.contains("a normal note after the block"), "later normal comment stripped");
     }
 }

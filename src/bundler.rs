@@ -21,7 +21,9 @@ lazy_static! {
     // The lib is wrapped in `pub mod <crate_name>`, so absolute `crate::` paths inside
     // the lib are rewritten to `crate::<crate_name>::`. This is correct for both `use`
     // statements and inline expression paths, regardless of module nesting depth.
-    static ref CRATE_PATH_RE: Regex = Regex::new(r"\bcrate::").unwrap();
+    // The optional first segment and trailing `!` let us special-case macro invocations:
+    // `crate::NAME!` is a `#[macro_export]` macro, which stays at the bundle's crate root.
+    static ref CRATE_PATH_RE: Regex = Regex::new(r"\bcrate::(?P<seg>\w+)?(?P<bang>!)?").unwrap();
     static ref MINIFY_RE: Regex = Regex::new(r"^\s*(?P<contents>.*)\s*$").unwrap();
 }
 
@@ -295,8 +297,7 @@ impl<'a> Bundler<'a> {
     fn emit_line(&mut self, line: &str) -> Result<()> {
         // Rewrite absolute crate:: paths inside the lib to crate::<crate_name>::.
         let cow = if self.in_lib {
-            let repl = format!("crate::{}::", self._crate_name);
-            CRATE_PATH_RE.replace_all(line, repl.as_str())
+            std::borrow::Cow::Owned(rewrite_crate_paths(line, &self._crate_name))
         } else {
             std::borrow::Cow::Borrowed(line)
         };
@@ -421,6 +422,28 @@ fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Rewrite absolute `crate::` paths from inside the lib so they resolve in the
+/// bundled crate, where the lib is nested under `pub mod <crate_name>`.
+///
+/// Ordinary item paths gain the crate-name prefix (`crate::X` -> `crate::<name>::X`),
+/// but `#[macro_export]` macro invocations (`crate::NAME!`) are left untouched:
+/// exported macros are always hoisted to the crate root, so they live at
+/// `crate::NAME!` in the bundle too and must not be prefixed.
+fn rewrite_crate_paths(line: &str, crate_name: &str) -> String {
+    CRATE_PATH_RE
+        .replace_all(line, |caps: &regex::Captures| {
+            match (caps.name("seg"), caps.name("bang")) {
+                // `crate::NAME!` -> macro_export invocation, keep at crate root.
+                (Some(seg), Some(_)) => format!("crate::{}!", seg.as_str()),
+                // `crate::seg...` -> prefix the (already consumed) first segment.
+                (Some(seg), None) => format!("crate::{}::{}", crate_name, seg.as_str()),
+                // Bare `crate::` (e.g. `crate::{a, b}`, `crate::*`): just prefix.
+                _ => format!("crate::{}::", crate_name),
+            }
+        })
+        .into_owned()
+}
+
 /// If a raw string literal (`r"..."`, `r#"..."#`, `br"..."`, ...) starts at
 /// `start`, copy it verbatim into `out` and return the index just past it.
 /// Returns `None` when there is no raw string at `start` (e.g. a raw identifier
@@ -513,6 +536,20 @@ mod tests {
         assert_eq!(b.strip_comments_in_line("code; /* start").trim(), "code;");
         assert_eq!(b.strip_comments_in_line("still in comment").trim(), "");
         assert_eq!(b.strip_comments_in_line("end */ tail").trim(), "tail");
+    }
+
+    #[test]
+    fn rewrites_item_paths_but_not_macro_export_invocations() {
+        // Ordinary item paths get the crate-name prefix, at any nesting depth.
+        assert_eq!(rewrite_crate_paths("use crate::foo::Bar;", "mylib"), "use crate::mylib::foo::Bar;");
+        assert_eq!(rewrite_crate_paths("$crate::a::B", "mylib"), "$crate::mylib::a::B");
+        // Brace / glob imports keep working (no first ident segment).
+        assert_eq!(rewrite_crate_paths("use crate::{a, b};", "mylib"), "use crate::mylib::{a, b};");
+        assert_eq!(rewrite_crate_paths("use crate::*;", "mylib"), "use crate::mylib::*;");
+        // `#[macro_export]` macro invocations stay at the crate root (no prefix).
+        assert_eq!(rewrite_crate_paths("let g = crate::my_macro!(A => 1.0);", "mylib"), "let g = crate::my_macro!(A => 1.0);");
+        // Non-crate paths are untouched (word boundary guards `mycrate`).
+        assert_eq!(rewrite_crate_paths("use mycrate::foo;", "mylib"), "use mycrate::foo;");
     }
 
     #[test]
